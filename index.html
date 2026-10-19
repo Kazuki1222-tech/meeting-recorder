@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>会議レコーダー</title>
+<style>
+/* 1カラムの操作盤：状態→メーター→操作→録音一覧 */
+:root{
+  --bg:#f3f5f4;--panel:#ffffff;--fg:#1c2421;--muted:#5e6b66;--line:#d8dfdc;
+  --accent:#0f6e5c;--rec:#c8372d;--warn:#a86a00;
+  --font:"Hiragino Sans","Noto Sans JP","Yu Gothic UI",system-ui,sans-serif;
+  --mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+}
+@media (prefers-color-scheme:dark){:root{
+  --bg:#121816;--panel:#1b2320;--fg:#e6ece9;--muted:#93a29c;--line:#2c3733;
+  --accent:#3fb59a;--rec:#ff6a5e;--warn:#e0a73a;color-scheme:dark}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.6 var(--font);
+  padding:32px max(16px,env(safe-area-inset-left)) 48px max(16px,env(safe-area-inset-right))}
+main{max-width:620px;margin:0 auto;display:grid;gap:20px}
+h1{font-size:22px;margin:0;letter-spacing:.02em}
+.sub{color:var(--muted);margin:4px 0 0;font-size:13px}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:20px;display:grid;gap:16px}
+.status{display:flex;align-items:center;justify-content:space-between;gap:12px}
+.dot{width:12px;height:12px;border-radius:50%;background:var(--line);display:inline-block;margin-right:8px;vertical-align:middle}
+.rec .dot{background:var(--rec);animation:blink 1.2s infinite}
+@keyframes blink{50%{opacity:.25}}
+@media (prefers-reduced-motion:reduce){.rec .dot{animation:none}}
+.time{font:600 28px var(--mono);font-variant-numeric:tabular-nums}
+.meter{display:grid;grid-template-columns:5.5em 1fr;align-items:center;gap:10px;font-size:13px;color:var(--muted)}
+.bar{height:10px;background:var(--bg);border:1px solid var(--line);border-radius:5px;overflow:hidden}
+.bar i{display:block;height:100%;width:0;background:var(--accent);transition:width .08s}
+.opts{display:grid;gap:8px;font-size:14px}
+label{display:flex;gap:8px;align-items:center}
+.btns{display:flex;gap:10px;flex-wrap:wrap}
+button{font:600 15px var(--font);padding:12px 20px;border-radius:8px;border:1px solid var(--line);background:var(--panel);color:var(--fg);cursor:pointer}
+button.primary{background:var(--rec);border-color:var(--rec);color:#fff}
+button:disabled{opacity:.45;cursor:not-allowed}
+button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.msg{font-size:13px;color:var(--warn);min-height:1.2em;margin:0}
+ul{list-style:none;margin:0;padding:0;display:grid;gap:10px}
+li{display:grid;gap:6px;padding:12px;border:1px solid var(--line);border-radius:8px}
+li .row{display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;font-size:13px}
+li a{color:var(--accent);font-weight:600}
+audio{width:100%}
+.how{font-size:13px;color:var(--muted)}
+.how ol{margin:6px 0 0;padding-left:1.3em}
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>会議レコーダー</h1>
+    <p class="sub">Zoom・Teamsの相手の音声と自分のマイクを1本に録音します。データはこのPC内だけで処理されます。</p>
+  </header>
+
+  <section class="panel" id="panel">
+    <div class="status">
+      <div id="state"><span class="dot"></span><span id="stateText">待機中</span></div>
+      <div class="time" id="time">00:00:00</div>
+    </div>
+    <div class="meter"><span>相手</span><div class="bar"><i id="mRemote"></i></div></div>
+    <div class="meter"><span>自分</span><div class="bar"><i id="mMic"></i></div></div>
+    <div class="opts">
+      <label><input type="checkbox" id="useMic" checked> 自分のマイクも録音する</label>
+      <label><input type="checkbox" id="separate"> 相手・自分を別ファイルでも保存する</label>
+    </div>
+    <div class="btns">
+      <button class="primary" id="start">録音開始</button>
+      <button id="stop" disabled>停止して保存</button>
+    </div>
+    <p class="msg" id="msg"></p>
+  </section>
+
+  <section class="panel">
+    <strong>録音一覧</strong>
+    <ul id="list"><li class="how">まだ録音はありません。</li></ul>
+  </section>
+
+  <section class="how">
+    <strong>使い方</strong>
+    <ol>
+      <li>このファイルをPCのChromeかEdgeで開く。</li>
+      <li>「録音開始」→ 共有画面の選択が出る。
+        <br>・Zoom/Teamsをブラウザで参加中 →「タブ」でその会議タブを選び「タブの音声も共有」をON。
+        <br>・デスクトップアプリで参加中（Windows）→「画面全体」を選び「システム音声も共有」をON。
+        <br>・Mac＋デスクトップアプリ → 新しめのmacOS/Chromeなら「画面全体」でシステム音声が選べます。出ない場合はブラウザ版で参加してください。</li>
+      <li>終わったら「停止して保存」→ 一覧からダウンロード（.webm）。</li>
+    </ol>
+    <p>録音する前に参加者の了承を取ってください。ヘッドホン使用推奨（スピーカーだと相手の声が二重に入ります）。</p>
+  </section>
+</main>
+
+<script>
+const $=id=>document.getElementById(id);
+let ctx,displayStream,micStream,recorders=[],chunks={},timer,t0,raf;
+const mime=['audio/webm;codecs=opus','audio/webm'].find(m=>window.MediaRecorder&&MediaRecorder.isTypeSupported(m))||'';
+
+function setMsg(t){$('msg').textContent=t||''}
+function fmt(ms){const s=Math.floor(ms/1000);return [s/3600|0,(s/60|0)%60,s%60].map(n=>String(n).padStart(2,'0')).join(':')}
+function stamp(){const d=new Date(),p=n=>String(n).padStart(2,'0');return `${d.getFullYear()}${p(d.getMonth()+1)}${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}`}
+
+function meter(node,el){
+  const an=ctx.createAnalyser();an.fftSize=512;node.connect(an);
+  const buf=new Uint8Array(an.fftSize);
+  return ()=>{an.getByteTimeDomainData(buf);let m=0;for(const v of buf)m=Math.max(m,Math.abs(v-128));el.style.width=Math.min(100,m/128*180)+'%'};
+}
+
+$('start').onclick=async()=>{
+  setMsg('');
+  if(!navigator.mediaDevices?.getDisplayMedia){setMsg('このブラウザは非対応です。PCのChromeかEdgeで開いてください。');return}
+  try{
+    displayStream=await navigator.mediaDevices.getDisplayMedia({video:true,audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false},systemAudio:'include'});
+  }catch(e){setMsg('共有がキャンセルされました。');return}
+  if(!displayStream.getAudioTracks().length){
+    displayStream.getTracks().forEach(t=>t.stop());
+    setMsg('音声が共有されていません。共有画面で「タブの音声」または「システム音声」をONにしてやり直してください。');return;
+  }
+  displayStream.getVideoTracks().forEach(t=>t.stop());
+  if($('useMic').checked){
+    try{micStream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true}})}
+    catch(e){setMsg('マイクが使えないため相手の音声のみ録音します。');micStream=null}
+  }
+  ctx=new AudioContext();
+  const dest=ctx.createMediaStreamDestination();
+  const remote=ctx.createMediaStreamSource(new MediaStream(displayStream.getAudioTracks()));
+  remote.connect(dest);
+  const meters=[meter(remote,$('mRemote'))];
+  let mic=null;
+  if(micStream){mic=ctx.createMediaStreamSource(micStream);mic.connect(dest);meters.push(meter(mic,$('mMic')))}
+
+  const tracks=[{name:'mix',stream:dest.stream}];
+  if($('separate').checked){
+    tracks.push({name:'相手',stream:new MediaStream(displayStream.getAudioTracks())});
+    if(micStream)tracks.push({name:'自分',stream:micStream});
+  }
+  const id=stamp();recorders=[];
+  for(const tr of tracks){
+    const r=new MediaRecorder(tr.stream,mime?{mimeType:mime,audioBitsPerSecond:128000}:{});
+    chunks[tr.name]=[];
+    r.ondataavailable=e=>e.data.size&&chunks[tr.name].push(e.data);
+    r.onstop=()=>addItem(id,tr.name,new Blob(chunks[tr.name],{type:r.mimeType||'audio/webm'}));
+    r.start(1000);recorders.push(r);
+  }
+  displayStream.getAudioTracks()[0].onended=()=>stop();
+  t0=Date.now();timer=setInterval(()=>$('time').textContent=fmt(Date.now()-t0),500);
+  const loop=()=>{meters.forEach(f=>f());raf=requestAnimationFrame(loop)};loop();
+  $('panel').classList.add('rec');$('stateText').textContent='録音中';
+  $('start').disabled=true;$('stop').disabled=false;
+};
+
+function stop(){
+  if(!recorders.length)return;
+  recorders.forEach(r=>r.state!=='inactive'&&r.stop());recorders=[];
+  [displayStream,micStream].forEach(s=>s&&s.getTracks().forEach(t=>t.stop()));
+  clearInterval(timer);cancelAnimationFrame(raf);
+  setTimeout(()=>ctx&&ctx.close(),500);
+  $('mRemote').style.width=$('mMic').style.width='0';
+  $('panel').classList.remove('rec');$('stateText').textContent='待機中';
+  $('start').disabled=false;$('stop').disabled=true;
+}
+$('stop').onclick=stop;
+
+function addItem(id,name,blob){
+  const list=$('list');if(list.querySelector('.how'))list.innerHTML='';
+  const url=URL.createObjectURL(blob),fn=`会議録音_${id}_${name}.webm`;
+  const li=document.createElement('li');
+  li.innerHTML=`<div class="row"><span></span><a></a></div><audio controls></audio>`;
+  li.querySelector('span').textContent=`${fn}（${(blob.size/1048576).toFixed(1)} MB）`;
+  const a=li.querySelector('a');a.href=url;a.download=fn;a.textContent='ダウンロード';
+  li.querySelector('audio').src=url;
+  list.prepend(li);
+}
+window.addEventListener('beforeunload',e=>{if(recorders.length){e.preventDefault();e.returnValue=''}});
+</script>
+</body>
+</html>
