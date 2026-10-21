@@ -88,18 +88,27 @@ audio{width:100%}
         <br>・デスクトップアプリで参加中（Windows）→「画面全体」を選び「システム音声も共有」をON。
         <br>・Mac＋デスクトップアプリ → 新しめのmacOS/Chromeなら「画面全体」でシステム音声が選べます。出ない場合はブラウザ版で参加してください。</li>
       <li>Teamsの待機室（ロビー）から入室すると画面が切り替わり、共有が切れることがあります。入室が許可されてから「録音開始」を押すのが確実です。途中で切れても録音は止まらないので、「相手の音声を選び直す」で再接続してください。</li>
-      <li>終わったら「停止して保存」→ 一覧からダウンロード（.webm）。</li>
+      <li>終わったら「停止して保存」→ 一覧からダウンロード（.wav・16kHzモノラル。MacWhisperやwhisper.cppにそのまま渡せます。1時間で約115MB）。</li>
     </ol>
     <p>録音する前に参加者の了承を取ってください。ヘッドホン使用推奨（スピーカーだと相手の声が二重に入ります）。</p>
   </section>
 </main>
 
-<script src="https://cdn.jsdelivr.net/npm/fix-webm-duration@1.0.6/fix-webm-duration.js"></script>
 <script>
 const $=id=>document.getElementById(id);
-let ctx,mixDest,remoteDest,micDest,micStream,recorders=[],timer,t0,raf;
+const RATE=16000; // Whisperが内部で使うのと同じ16kHz・モノラルで直接録る
+let ctx,mixBus,remoteBus,micBus,micStream,captures=[],timer,t0,raf;
 let displayStreams=[],meterFns={remote:null,mic:null},recording=false;
-const mime=['audio/webm;codecs=opus','audio/webm'].find(m=>window.MediaRecorder&&MediaRecorder.isTypeSupported(m))||'';
+
+// 入力をモノラルにまとめて1秒ごとにメインへ送る。入力が無い間は無音を書き、時間軸を揃える
+const WORKLET=`class Cap extends AudioWorkletProcessor{
+  constructor(){super();this.buf=new Float32Array(${RATE});this.n=0;this.on=true;
+    this.port.onmessage=e=>{if(e.data==='flush'){if(this.n)this.port.postMessage(this.buf.slice(0,this.n));this.n=0;this.on=false;this.port.postMessage('done')}}}
+  process(inputs){if(!this.on)return false;const ch=inputs[0]||[];const len=ch.length?ch[0].length:128;
+    for(let i=0;i<len;i++){let v=0;for(let c=0;c<ch.length;c++)v+=ch[c][i];if(ch.length)v/=ch.length;
+      this.buf[this.n++]=v;if(this.n===this.buf.length){this.port.postMessage(this.buf.slice());this.n=0}}
+    return true}}
+registerProcessor('cap',Cap);`;
 
 function setMsg(t){$('msg').textContent=t||''}
 function fmt(ms){const s=Math.floor(ms/1000);return [s/3600|0,(s/60|0)%60,s%60].map(n=>String(n).padStart(2,'0')).join(':')}
@@ -109,6 +118,25 @@ function meter(node,el){
   const an=ctx.createAnalyser();an.fftSize=512;node.connect(an);
   const buf=new Uint8Array(an.fftSize);
   return ()=>{an.getByteTimeDomainData(buf);let m=0;for(const v of buf)m=Math.max(m,Math.abs(v-128));el.style.width=Math.min(100,m/128*180)+'%'};
+}
+
+function toInt16(f){const o=new Int16Array(f.length);for(let i=0;i<f.length;i++){const v=Math.max(-1,Math.min(1,f[i]));o[i]=v<0?v*0x8000:v*0x7fff}return o}
+
+function wavBlob(chunks){
+  const n=chunks.reduce((a,c)=>a+c.length,0),h=new DataView(new ArrayBuffer(44));
+  const w=(o,s)=>[...s].forEach((c,i)=>h.setUint8(o+i,c.charCodeAt(0)));
+  w(0,'RIFF');h.setUint32(4,36+n*2,true);w(8,'WAVE');w(12,'fmt ');h.setUint32(16,16,true);
+  h.setUint16(20,1,true);h.setUint16(22,1,true);h.setUint32(24,RATE,true);h.setUint32(28,RATE*2,true);
+  h.setUint16(32,2,true);h.setUint16(34,16,true);w(36,'data');h.setUint32(40,n*2,true);
+  return {blob:new Blob([h,...chunks],{type:'audio/wav'}),ms:n/RATE*1000};
+}
+
+function capture(bus,name){
+  const node=new AudioWorkletNode(ctx,'cap',{numberOfInputs:1,numberOfOutputs:1,outputChannelCount:[1]});
+  bus.connect(node);node.connect(ctx.destination); // 出力は無音。つなぐことで処理が回り続ける
+  const chunks=[];let resolve;const done=new Promise(r=>resolve=r);
+  node.port.onmessage=e=>e.data==='done'?resolve():chunks.push(toInt16(e.data));
+  return {name,finish:async()=>{node.port.postMessage('flush');await done;node.disconnect();return wavBlob(chunks)}};
 }
 
 // 相手の音声（タブ/システム音声）を取得して録音先につなぐ。録音中に何度でも選び直せる
@@ -121,10 +149,9 @@ async function pickRemote(){
     ds.getTracks().forEach(t=>t.stop());
     setMsg('音声が共有されていません。共有画面で「タブの音声」または「システム音声」をONにしてください。');return false;
   }
-  // 映像トラックは止めずに持っておく（止めると共有ごと切れるブラウザがあるため）
-  displayStreams.push(ds);
+  displayStreams.push(ds); // 映像トラックは止めずに持っておく（止めると共有ごと切れるブラウザがあるため）
   const src=ctx.createMediaStreamSource(new MediaStream(ds.getAudioTracks()));
-  src.connect(mixDest);src.connect(remoteDest);
+  src.connect(mixBus);src.connect(remoteBus);
   meterFns.remote=meter(src,$('mRemote'));
   ds.getAudioTracks()[0].onended=()=>{
     if(!recording)return;
@@ -137,74 +164,60 @@ async function pickRemote(){
 
 $('start').onclick=async()=>{
   setMsg('');
-  if(!navigator.mediaDevices?.getDisplayMedia){setMsg('このブラウザは非対応です。PCのChromeかEdgeで開いてください。');return}
-  ctx=new AudioContext();
-  mixDest=ctx.createMediaStreamDestination();
-  remoteDest=ctx.createMediaStreamDestination();
-  micDest=ctx.createMediaStreamDestination();
-  // 無音を流し続けて、相手の共有が切れても録音トラックが止まらないようにする
-  const silent=ctx.createConstantSource();silent.offset.value=0;
-  [mixDest,remoteDest,micDest].forEach(d=>silent.connect(d));silent.start();
+  if(!navigator.mediaDevices?.getDisplayMedia||!window.AudioWorkletNode){setMsg('このブラウザは非対応です。PCのChromeかEdgeで開いてください。');return}
+  $('start').disabled=true;
+  ctx=new AudioContext({sampleRate:RATE});
+  try{await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([WORKLET],{type:'text/javascript'})))}
+  catch(e){await ctx.audioWorklet.addModule('data:text/javascript;charset=utf-8,'+encodeURIComponent(WORKLET))} // file://で開いた場合
+  mixBus=ctx.createGain();remoteBus=ctx.createGain();micBus=ctx.createGain();
 
-  if(!await pickRemote()){ctx.close();if(!$('msg').textContent)setMsg('共有がキャンセルされました。');return}
+  if(!await pickRemote()){ctx.close();if(!$('msg').textContent)setMsg('共有がキャンセルされました。');$('start').disabled=false;return}
   if($('useMic').checked){
     try{
       micStream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true}});
-      const mic=ctx.createMediaStreamSource(micStream);mic.connect(mixDest);mic.connect(micDest);
+      const mic=ctx.createMediaStreamSource(micStream);mic.connect(mixBus);mic.connect(micBus);
       meterFns.mic=meter(mic,$('mMic'));
     }catch(e){setMsg('マイクが使えないため相手の音声のみ録音します。');micStream=null}
   }
 
-  const targets=[{name:'mix',stream:mixDest.stream}];
+  captures=[capture(mixBus,'mix')];
   if($('separate').checked){
-    targets.push({name:'相手',stream:remoteDest.stream});
-    if(micStream)targets.push({name:'自分',stream:micDest.stream});
+    captures.push(capture(remoteBus,'相手'));
+    if(micStream)captures.push(capture(micBus,'自分'));
   }
-  const id=stamp();recorders=[];
-  for(const tg of targets){
-    const r=new MediaRecorder(tg.stream,mime?{mimeType:mime,audioBitsPerSecond:128000}:{});
-    const chunks=[];
-    r.ondataavailable=e=>e.data.size&&chunks.push(e.data);
-    r.onstop=async()=>{
-      const dur=Date.now()-t0;
-      let blob=new Blob(chunks,{type:r.mimeType||'audio/webm'});
-      // MediaRecorderのwebmには長さ情報が無く早送りできないので書き足す
-      try{if(window.ysFixWebmDuration)blob=await ysFixWebmDuration(blob,dur,{logger:false})}catch(e){}
-      addItem(id,tg.name,blob,dur);
-    };
-    r.start(1000);recorders.push(r);
-  }
-  recording=true;
+  window.__id=stamp();recording=true;
   t0=Date.now();timer=setInterval(()=>$('time').textContent=fmt(Date.now()-t0),500);
   const loop=()=>{meterFns.remote&&meterFns.remote();meterFns.mic&&meterFns.mic();raf=requestAnimationFrame(loop)};loop();
   $('panel').classList.add('rec');$('stateText').textContent='録音中';
-  $('start').disabled=true;$('stop').disabled=false;
+  $('stop').disabled=false;
 };
 
 $('repick').onclick=async()=>{
   if(await pickRemote()){$('repick').hidden=true;setMsg('相手の音声を再接続しました。')}
 };
 
-function stop(){
+async function stop(){
   if(!recording)return;recording=false;
-  recorders.forEach(r=>r.state!=='inactive'&&r.stop());recorders=[];
+  $('stop').disabled=true;$('repick').hidden=true;$('stateText').textContent='保存中…';
+  clearInterval(timer);cancelAnimationFrame(raf);
+  const id=window.__id;
+  for(const c of captures){const {blob,ms}=await c.finish();addItem(id,c.name,blob,ms)}
+  captures=[];
   displayStreams.forEach(s=>s.getTracks().forEach(t=>t.stop()));displayStreams=[];
   micStream&&micStream.getTracks().forEach(t=>t.stop());micStream=null;
-  meterFns={remote:null,mic:null};
-  clearInterval(timer);cancelAnimationFrame(raf);
-  setTimeout(()=>ctx&&ctx.close(),1500);
+  meterFns={remote:null,mic:null};ctx.close();
   $('mRemote').style.width=$('mMic').style.width='0';
   $('panel').classList.remove('rec');$('stateText').textContent='待機中';
-  $('start').disabled=false;$('stop').disabled=true;$('repick').hidden=true;
+  $('start').disabled=false;
 }
 $('stop').onclick=stop;
 
-function addItem(id,name,blob,dur){
+function addItem(id,name,blob,ms){
   const list=$('list');if(list.querySelector('.how'))list.innerHTML='';
-  const url=URL.createObjectURL(blob),fn=`会議録音_${id}_${name}.webm`;
+  const url=URL.createObjectURL(blob),fn=`会議録音_${id}_${name}.wav`;
   const li=document.createElement('li');
   li.innerHTML=`<div class="row"><span></span><a></a></div><audio controls preload="metadata"></audio>`;
-  li.querySelector('span').textContent=`${fn}（${fmt(dur)}・${(blob.size/1048576).toFixed(1)} MB）`;
+  li.querySelector('span').textContent=`${fn}（${fmt(ms)}・${(blob.size/1048576).toFixed(1)} MB）`;
   const a=li.querySelector('a');a.href=url;a.download=fn;a.textContent='ダウンロード';
   li.querySelector('audio').src=url;
   list.prepend(li);
