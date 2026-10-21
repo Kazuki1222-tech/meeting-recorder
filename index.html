@@ -69,6 +69,7 @@ audio{width:100%}
     <div class="btns">
       <button class="primary" id="start">録音開始</button>
       <button id="stop" disabled>停止して保存</button>
+      <button id="repick" hidden>相手の音声を選び直す</button>
     </div>
     <p class="msg" id="msg"></p>
   </section>
@@ -86,15 +87,18 @@ audio{width:100%}
         <br>・Zoom/Teamsをブラウザで参加中 →「タブ」でその会議タブを選び「タブの音声も共有」をON。
         <br>・デスクトップアプリで参加中（Windows）→「画面全体」を選び「システム音声も共有」をON。
         <br>・Mac＋デスクトップアプリ → 新しめのmacOS/Chromeなら「画面全体」でシステム音声が選べます。出ない場合はブラウザ版で参加してください。</li>
+      <li>Teamsの待機室（ロビー）から入室すると画面が切り替わり、共有が切れることがあります。入室が許可されてから「録音開始」を押すのが確実です。途中で切れても録音は止まらないので、「相手の音声を選び直す」で再接続してください。</li>
       <li>終わったら「停止して保存」→ 一覧からダウンロード（.webm）。</li>
     </ol>
     <p>録音する前に参加者の了承を取ってください。ヘッドホン使用推奨（スピーカーだと相手の声が二重に入ります）。</p>
   </section>
 </main>
 
+<script src="https://cdn.jsdelivr.net/npm/fix-webm-duration@1.0.6/fix-webm-duration.js"></script>
 <script>
 const $=id=>document.getElementById(id);
-let ctx,displayStream,micStream,recorders=[],chunks={},timer,t0,raf;
+let ctx,mixDest,remoteDest,micDest,micStream,recorders=[],timer,t0,raf;
+let displayStreams=[],meterFns={remote:null,mic:null},recording=false;
 const mime=['audio/webm;codecs=opus','audio/webm'].find(m=>window.MediaRecorder&&MediaRecorder.isTypeSupported(m))||'';
 
 function setMsg(t){$('msg').textContent=t||''}
@@ -107,72 +111,105 @@ function meter(node,el){
   return ()=>{an.getByteTimeDomainData(buf);let m=0;for(const v of buf)m=Math.max(m,Math.abs(v-128));el.style.width=Math.min(100,m/128*180)+'%'};
 }
 
+// 相手の音声（タブ/システム音声）を取得して録音先につなぐ。録音中に何度でも選び直せる
+async function pickRemote(){
+  let ds;
+  try{
+    ds=await navigator.mediaDevices.getDisplayMedia({video:true,audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false},systemAudio:'include',selfBrowserSurface:'exclude'});
+  }catch(e){return false}
+  if(!ds.getAudioTracks().length){
+    ds.getTracks().forEach(t=>t.stop());
+    setMsg('音声が共有されていません。共有画面で「タブの音声」または「システム音声」をONにしてください。');return false;
+  }
+  // 映像トラックは止めずに持っておく（止めると共有ごと切れるブラウザがあるため）
+  displayStreams.push(ds);
+  const src=ctx.createMediaStreamSource(new MediaStream(ds.getAudioTracks()));
+  src.connect(mixDest);src.connect(remoteDest);
+  meterFns.remote=meter(src,$('mRemote'));
+  ds.getAudioTracks()[0].onended=()=>{
+    if(!recording)return;
+    meterFns.remote=null;$('mRemote').style.width='0';
+    setMsg('相手の音声の共有が切れました（画面が切り替わった可能性）。録音は続いています。「相手の音声を選び直す」を押してください。');
+    $('repick').hidden=false;
+  };
+  return true;
+}
+
 $('start').onclick=async()=>{
   setMsg('');
   if(!navigator.mediaDevices?.getDisplayMedia){setMsg('このブラウザは非対応です。PCのChromeかEdgeで開いてください。');return}
-  try{
-    displayStream=await navigator.mediaDevices.getDisplayMedia({video:true,audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false},systemAudio:'include'});
-  }catch(e){setMsg('共有がキャンセルされました。');return}
-  if(!displayStream.getAudioTracks().length){
-    displayStream.getTracks().forEach(t=>t.stop());
-    setMsg('音声が共有されていません。共有画面で「タブの音声」または「システム音声」をONにしてやり直してください。');return;
-  }
-  displayStream.getVideoTracks().forEach(t=>t.stop());
-  if($('useMic').checked){
-    try{micStream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true}})}
-    catch(e){setMsg('マイクが使えないため相手の音声のみ録音します。');micStream=null}
-  }
   ctx=new AudioContext();
-  const dest=ctx.createMediaStreamDestination();
-  const remote=ctx.createMediaStreamSource(new MediaStream(displayStream.getAudioTracks()));
-  remote.connect(dest);
-  const meters=[meter(remote,$('mRemote'))];
-  let mic=null;
-  if(micStream){mic=ctx.createMediaStreamSource(micStream);mic.connect(dest);meters.push(meter(mic,$('mMic')))}
+  mixDest=ctx.createMediaStreamDestination();
+  remoteDest=ctx.createMediaStreamDestination();
+  micDest=ctx.createMediaStreamDestination();
+  // 無音を流し続けて、相手の共有が切れても録音トラックが止まらないようにする
+  const silent=ctx.createConstantSource();silent.offset.value=0;
+  [mixDest,remoteDest,micDest].forEach(d=>silent.connect(d));silent.start();
 
-  const tracks=[{name:'mix',stream:dest.stream}];
+  if(!await pickRemote()){ctx.close();if(!$('msg').textContent)setMsg('共有がキャンセルされました。');return}
+  if($('useMic').checked){
+    try{
+      micStream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true}});
+      const mic=ctx.createMediaStreamSource(micStream);mic.connect(mixDest);mic.connect(micDest);
+      meterFns.mic=meter(mic,$('mMic'));
+    }catch(e){setMsg('マイクが使えないため相手の音声のみ録音します。');micStream=null}
+  }
+
+  const targets=[{name:'mix',stream:mixDest.stream}];
   if($('separate').checked){
-    tracks.push({name:'相手',stream:new MediaStream(displayStream.getAudioTracks())});
-    if(micStream)tracks.push({name:'自分',stream:micStream});
+    targets.push({name:'相手',stream:remoteDest.stream});
+    if(micStream)targets.push({name:'自分',stream:micDest.stream});
   }
   const id=stamp();recorders=[];
-  for(const tr of tracks){
-    const r=new MediaRecorder(tr.stream,mime?{mimeType:mime,audioBitsPerSecond:128000}:{});
-    chunks[tr.name]=[];
-    r.ondataavailable=e=>e.data.size&&chunks[tr.name].push(e.data);
-    r.onstop=()=>addItem(id,tr.name,new Blob(chunks[tr.name],{type:r.mimeType||'audio/webm'}));
+  for(const tg of targets){
+    const r=new MediaRecorder(tg.stream,mime?{mimeType:mime,audioBitsPerSecond:128000}:{});
+    const chunks=[];
+    r.ondataavailable=e=>e.data.size&&chunks.push(e.data);
+    r.onstop=async()=>{
+      const dur=Date.now()-t0;
+      let blob=new Blob(chunks,{type:r.mimeType||'audio/webm'});
+      // MediaRecorderのwebmには長さ情報が無く早送りできないので書き足す
+      try{if(window.ysFixWebmDuration)blob=await ysFixWebmDuration(blob,dur,{logger:false})}catch(e){}
+      addItem(id,tg.name,blob,dur);
+    };
     r.start(1000);recorders.push(r);
   }
-  displayStream.getAudioTracks()[0].onended=()=>stop();
+  recording=true;
   t0=Date.now();timer=setInterval(()=>$('time').textContent=fmt(Date.now()-t0),500);
-  const loop=()=>{meters.forEach(f=>f());raf=requestAnimationFrame(loop)};loop();
+  const loop=()=>{meterFns.remote&&meterFns.remote();meterFns.mic&&meterFns.mic();raf=requestAnimationFrame(loop)};loop();
   $('panel').classList.add('rec');$('stateText').textContent='録音中';
   $('start').disabled=true;$('stop').disabled=false;
 };
 
+$('repick').onclick=async()=>{
+  if(await pickRemote()){$('repick').hidden=true;setMsg('相手の音声を再接続しました。')}
+};
+
 function stop(){
-  if(!recorders.length)return;
+  if(!recording)return;recording=false;
   recorders.forEach(r=>r.state!=='inactive'&&r.stop());recorders=[];
-  [displayStream,micStream].forEach(s=>s&&s.getTracks().forEach(t=>t.stop()));
+  displayStreams.forEach(s=>s.getTracks().forEach(t=>t.stop()));displayStreams=[];
+  micStream&&micStream.getTracks().forEach(t=>t.stop());micStream=null;
+  meterFns={remote:null,mic:null};
   clearInterval(timer);cancelAnimationFrame(raf);
-  setTimeout(()=>ctx&&ctx.close(),500);
+  setTimeout(()=>ctx&&ctx.close(),1500);
   $('mRemote').style.width=$('mMic').style.width='0';
   $('panel').classList.remove('rec');$('stateText').textContent='待機中';
-  $('start').disabled=false;$('stop').disabled=true;
+  $('start').disabled=false;$('stop').disabled=true;$('repick').hidden=true;
 }
 $('stop').onclick=stop;
 
-function addItem(id,name,blob){
+function addItem(id,name,blob,dur){
   const list=$('list');if(list.querySelector('.how'))list.innerHTML='';
   const url=URL.createObjectURL(blob),fn=`会議録音_${id}_${name}.webm`;
   const li=document.createElement('li');
-  li.innerHTML=`<div class="row"><span></span><a></a></div><audio controls></audio>`;
-  li.querySelector('span').textContent=`${fn}（${(blob.size/1048576).toFixed(1)} MB）`;
+  li.innerHTML=`<div class="row"><span></span><a></a></div><audio controls preload="metadata"></audio>`;
+  li.querySelector('span').textContent=`${fn}（${fmt(dur)}・${(blob.size/1048576).toFixed(1)} MB）`;
   const a=li.querySelector('a');a.href=url;a.download=fn;a.textContent='ダウンロード';
   li.querySelector('audio').src=url;
   list.prepend(li);
 }
-window.addEventListener('beforeunload',e=>{if(recorders.length){e.preventDefault();e.returnValue=''}});
+window.addEventListener('beforeunload',e=>{if(recording){e.preventDefault();e.returnValue=''}});
 </script>
 </body>
 </html>
